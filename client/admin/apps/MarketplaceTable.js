@@ -1,17 +1,16 @@
-import { Box, Table, TextInput, Icon, Chip } from '@rocket.chat/fuselage';
+import React, { useMemo, useCallback, useState, useEffect, useRef } from 'react';
+import { Box, Table, TextInput, Icon, Tag, Avatar } from '@rocket.chat/fuselage';
 import { useDebouncedValue, useResizeObserver } from '@rocket.chat/fuselage-hooks';
-import React, { useMemo, useCallback, useState, useEffect } from 'react';
 
+import PriceDisplay from './PriceDisplay';
+import { AppStatus } from './AppStatus';
 import { GenericTable, Th } from '../../../app/ui/client/components/GenericTable';
+import { useMethod } from '../../contexts/ServerContext';
 import { useTranslation } from '../../contexts/TranslationContext';
 import { useRoute } from '../../contexts/RouterContext';
-import { useEndpointDataExperimental } from '../../hooks/useEndpointDataExperimental';
-import { useFormatDateAndTime } from '../../hooks/useFormatDateAndTime';
 import { Apps } from '../../../app/apps/client/orchestrator';
-import { formatPricingPlan } from '../../../app/apps/client/admin/helpers';
-
-
-// const style = { whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' };
+import { AppEvents } from '../../../app/apps/client/communication';
+import { handleAPIError } from '../../../app/apps/client/admin/helpers';
 
 const FilterByText = React.memo(({ setFilter, ...props }) => {
 	const t = useTranslation();
@@ -36,52 +35,145 @@ const useResizeInlineBreakpoint = (sizes = [], debounceDelay = 0) => {
 	return [ref, ...sizes];
 };
 
-const formatPrice = (purchaseType, pricingPlans, price) => {
-	if (purchaseType === 'subscription') {
-		if (!pricingPlans || !Array.isArray(pricingPlans) || pricingPlans.length === 0) {
+/* TODO
+ *	If order is reversed and search is performed, the result will return in the wrong order, then refresh correctly
+ *
+ */
+function useMarketplaceApps({ debouncedText, debouncedSort, current, itemsPerPage }) {
+	const [data, setData] = useState({});
+	const ref = useRef();
+	ref.current = data;
+
+	const getDataCopy = () => ref.current.slice(0);
+
+	const stringifiedData = JSON.stringify(data);
+
+	const handleAppAddedOrUpdated = useCallback(async (appId) => {
+		try {
+			const { status, version } = await Apps.getApp(appId);
+			const app = await Apps.getAppFromMarketplace(appId, version);
+			const updatedData = getDataCopy();
+			const index = updatedData.findIndex(({ id }) => id === appId);
+			updatedData[index] = {
+				...app,
+				installed: true,
+				status,
+				version,
+				marketplaceVersion: app.version,
+			};
+			setData(updatedData);
+		} catch (error) {
+			handleAPIError(error);
+		}
+	}, [stringifiedData, setData]);
+
+	const handleAppRemoved = useCallback((appId) => {
+		const updatedData = getDataCopy();
+		const app = updatedData.find(({ id }) => id === appId);
+		if (!app) {
 			return;
 		}
+		delete app.installed;
+		delete app.status;
+		app.version = app.marketplaceVersion;
 
-		return formatPricingPlan(pricingPlans[0]);
-	}
+		setData(updatedData);
+	}, [stringifiedData, setData]);
 
-	if (price > 0) {
-		return formatPrice(price);
-	}
+	const handleAppStatusChange = useCallback(({ appId, status }) => {
+		const updatedData = getDataCopy();
+		const app = updatedData.find(({ id }) => id === appId);
 
-	return 'Free';
-};
-
-export function MarketplaceTable({ type }) {
-	const t = useTranslation();
-	const formatDateAndTime = useFormatDateAndTime();
-	const [ref, isBig] = useResizeInlineBreakpoint([700], 200);
-
-	const [data, setData] = useState({});
+		if (!app) {
+			return;
+		}
+		app.status = status;
+		setData(updatedData);
+	}, [stringifiedData, setData]);
 
 	useEffect(() => {
 		(async () => {
-			const appsData = await Promise.all([Apps.getAppsFromMarketplace(), Apps.getApps()]);
-			setData(await Apps.getAppsFromMarketplace())
+			try {
+				const marketAndInstalledApps = await Promise.all([Apps.getAppsFromMarketplace(), Apps.getApps()]);
+				const appsData = marketAndInstalledApps[0].map((app) => {
+					const installedApp = marketAndInstalledApps[1].find(({ id }) => id === app.id);
+					if (!installedApp) {
+						return {
+							...app,
+							status: undefined,
+							marketplaceVersion: app.version,
+						};
+					}
+
+					return {
+						...app,
+						installed: true,
+						status: installedApp.status,
+						version: installedApp.version,
+						marketplaceVersion: app.version,
+					};
+				});
+
+				setData(appsData.sort((a, b) => (a.name.toLowerCase() > b.name.toLowerCase() ? 1 : -1)));
+
+				Apps.getWsListener().registerListener(AppEvents.APP_ADDED, handleAppAddedOrUpdated);
+				Apps.getWsListener().registerListener(AppEvents.APP_UPDATED, handleAppAddedOrUpdated);
+				Apps.getWsListener().registerListener(AppEvents.APP_REMOVED, handleAppRemoved);
+				Apps.getWsListener().registerListener(AppEvents.APP_STATUS_CHANGE, handleAppStatusChange);
+			} catch (e) {
+				handleAPIError(e);
+			}
 		})();
+
+		return () => {
+			Apps.getWsListener().unregisterListener(AppEvents.APP_ADDED, handleAppAddedOrUpdated);
+			Apps.getWsListener().unregisterListener(AppEvents.APP_UPDATED, handleAppAddedOrUpdated);
+			Apps.getWsListener().unregisterListener(AppEvents.APP_REMOVED, handleAppRemoved);
+			Apps.getWsListener().unregisterListener(AppEvents.APP_STATUS_CHANGE, handleAppStatusChange);
+		};
 	}, []);
+
+	const filteredValues = useMemo(() => {
+		if (data.length) {
+			let filtered = debouncedSort[1] === 'asc' ? data : data.reverse();
+
+			filtered = debouncedText ? filtered.filter((app) => app.name.toLowerCase().indexOf(debouncedText.toLowerCase()) > -1) : filtered;
+
+			const filteredLength = filtered.length;
+
+			const sliceStart = current > filteredLength ? 0 : current;
+
+			filtered = filtered.slice(sliceStart, current + itemsPerPage);
+
+			return [filtered, filteredLength];
+		}
+		return [null, 0];
+	}, [debouncedText, debouncedSort[1], stringifiedData, current, itemsPerPage]);
+
+	return [...filteredValues];
+}
+
+const objectFit = { objectFit: 'contain' };
+
+export function MarketplaceTable({ setModal }) {
+	const t = useTranslation();
+	const [ref, isBig] = useResizeInlineBreakpoint([700], 200);
 
 	const [params, setParams] = useState({ text: '', current: 0, itemsPerPage: 25 });
 	const [sort, setSort] = useState(['name', 'asc']);
 
 	const debouncedText = useDebouncedValue(params.text, 500);
-	const debouncedSort = useDebouncedValue(sort, 500);
+	const debouncedSort = useDebouncedValue(sort, 200);
 
-	const filteredData = useMemo(() => {
-		const filteredValues = Object.values(data).filter(debouncedSort).sort((a, b) => (a.name > b.name ? 1 : -1));
-		return debouncedSort[1] === 'asc' ? filteredValues : filteredValues.reverse();
-	}, [debouncedText, debouncedSort, params.current, params.itemsPerPage, JSON.stringify(data)]);
+	const [data, total] = useMarketplaceApps({ debouncedSort, debouncedText, ...params });
 
-	const router = useRoute('admin-integrations');
+	const getLoggedInCloud = useMethod('cloud:checkUserLoggedIn');
+	const isLoggedIn = getLoggedInCloud();
 
-	const onClick = (_id, type) => () => router.push({
-		context: 'edit',
-		type: type === 'webhook-incoming' ? 'incoming' : 'outgoing',
+	const router = useRoute('admin-apps');
+
+	const onClick = (_id) => () => router.push({
+		context: 'details',
 		id: _id,
 	});
 
@@ -100,31 +192,61 @@ export function MarketplaceTable({ type }) {
 		<Th key={'details'}>{t('Details')}</Th>,
 		<Th key={'price'}>{t('Price')}</Th>,
 		isBig && <Th key={'status'}>{t('Status')}</Th>,
-
 	].filter(Boolean), [sort, isBig]);
 
-	const renderRow = useCallback(({ author, name, id, description, categories, purchaseType, pricingPlans, price, purchased,  }) => {
-		const handler = useMemo(() => onClick(id, type), []);
-		return <Table.Row key={id} onKeyDown={handler} onClick={handler} tabIndex={0} role='link' action>
+	const renderRow = useCallback((props) => {
+		const {
+			author: { name: authorName },
+			name,
+			id,
+			description,
+			categories,
+			purchaseType,
+			pricingPlans,
+			price,
+			iconFileData,
+		} = props;
+
+		const [showStatus, setShowStatus] = useState(false);
+
+		const toggleShow = (state) => () => setShowStatus(state);
+		const handler = onClick(id);
+
+		return useMemo(() => <Table.Row key={id} onKeyDown={handler} onClick={handler} tabIndex={0} role='link' onMouseEnter={toggleShow(true)} onMouseLeave={toggleShow(false)} >
 			<Table.Cell withTruncatedText display='flex' flexDirection='row'>
-				<Box w='x40' h='x40' alignSelf='center'>avatar</Box>
+				<Avatar style={objectFit} size='x40' mie='x8' alignSelf='center' url={`data:image/png;base64,${ iconFileData }`}/>
 				<Box display='flex' flexDirection='column' alignSelf='flex-start'>
 					<Box color='default' fontScale='p2'>{name}</Box>
-					<Box color='default' fontScale='p2'>{`${ t('By') } ${ author.name }`}</Box>
+					<Box color='default' fontScale='p2'>{`${ t('By') } ${ authorName }`}</Box>
 				</Box>
 			</Table.Cell>
-			<Table.Cell withTruncatedText>
+			<Table.Cell>
 				<Box display='flex' flexDirection='column'>
-					<Box color='default'>{description}</Box>
-					{categories && <Box color='hint'>{categories.map((current) => <Chip key={current}>{current}</Chip>)}</Box>}
+					<Box color='default' withTruncatedText>{description}</Box>
+					{categories && <Box color='hint' display='flex' flex-direction='row' withTruncatedText>
+						{categories.map((current) => <Tag disabled key={current} mie='x4'>{current}</Tag>)}
+					</Box>}
 				</Box>
 			</Table.Cell>
-			<Table.Cell withTruncatedText>{formatPrice(purchaseType, pricingPlans, price)}</Table.Cell>
-			{isBig && <Table.Cell withTruncatedText>{}</Table.Cell>}
-		</Table.Row>;
+			<Table.Cell >
+				<PriceDisplay {...{ purchaseType, pricingPlans, price }} />
+			</Table.Cell>
+			{isBig && <Table.Cell withTruncatedText>
+				<AppStatus app={props} show={showStatus} setModal={setModal} isLoggedIn={isLoggedIn}/>
+			</Table.Cell>}
+		</Table.Row>, [id, showStatus, JSON.stringify(props)]);
 	}, []);
 
-	return <GenericTable ref={ref} FilterComponent={FilterByText} header={header} renderRow={renderRow} results={filteredData} total={filteredData.length} setParams={setParams} params={params} />;
+	return <GenericTable
+		ref={ref}
+		FilterComponent={FilterByText}
+		header={header}
+		renderRow={renderRow}
+		results={data}
+		total={total}
+		setParams={setParams}
+		params={params}
+	/>;
 }
 
 export default MarketplaceTable;
